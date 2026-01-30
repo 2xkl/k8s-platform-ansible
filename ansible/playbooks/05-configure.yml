@@ -10,6 +10,15 @@
     k8s_manifests_dir: "{{ playbook_dir }}/../../k8s"
 
   tasks:
+    # --- Connect Vault container to minikube network ---
+    - name: Connect Vault container to minikube Docker network
+      ansible.builtin.command: docker network connect minikube {{ vault_container_name }}
+      register: network_connect
+      changed_when: network_connect.rc == 0
+      failed_when:
+        - network_connect.rc != 0
+        - "'already exists' not in network_connect.stderr"
+
     # --- Apply namespace and service account first ---
     - name: Apply demo-app namespace
       ansible.builtin.command: kubectl apply -f {{ k8s_manifests_dir }}/namespace.yml
@@ -20,6 +29,17 @@
       ansible.builtin.command: kubectl apply -f {{ k8s_manifests_dir }}/service-account.yml
       register: sa_apply
       changed_when: "'created' in sa_apply.stdout or 'configured' in sa_apply.stdout"
+
+    - name: Create ClusterRoleBinding for token review
+      ansible.builtin.command: >
+        kubectl create clusterrolebinding vault-tokenreview-binding
+        --clusterrole=system:auth-delegator
+        --serviceaccount={{ demo_namespace }}:eso-vault-auth
+      register: crb_create
+      changed_when: crb_create.rc == 0
+      failed_when:
+        - crb_create.rc != 0
+        - "'already exists' not in crb_create.stderr"
 
     - name: Wait for service account token to be populated
       ansible.builtin.command: >
@@ -37,11 +57,34 @@
       register: k8s_api_url
       changed_when: false
 
-    - name: Get Kubernetes CA certificate
+    - name: Get Kubernetes CA certificate path
+      ansible.builtin.shell: >
+        kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority}'
+      register: k8s_ca_cert_path
+      changed_when: false
+
+    - name: Read Kubernetes CA certificate from file
+      ansible.builtin.slurp:
+        src: "{{ k8s_ca_cert_path.stdout }}"
+      register: k8s_ca_cert_file
+      when: k8s_ca_cert_path.stdout | length > 0
+
+    - name: Try getting CA cert from inline data
       ansible.builtin.shell: >
         kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d
-      register: k8s_ca_cert
+      register: k8s_ca_cert_inline
       changed_when: false
+      when: k8s_ca_cert_path.stdout | length == 0
+
+    - name: Set CA cert fact (from file)
+      ansible.builtin.set_fact:
+        k8s_ca_cert_content: "{{ k8s_ca_cert_file.content | b64decode }}"
+      when: k8s_ca_cert_path.stdout | length > 0
+
+    - name: Set CA cert fact (from inline)
+      ansible.builtin.set_fact:
+        k8s_ca_cert_content: "{{ k8s_ca_cert_inline.stdout }}"
+      when: k8s_ca_cert_path.stdout | length == 0
 
     - name: Get service account JWT token
       ansible.builtin.shell: >
@@ -91,8 +134,9 @@
         body_format: json
         body:
           kubernetes_host: "{{ k8s_api_url.stdout }}"
-          kubernetes_ca_cert: "{{ k8s_ca_cert.stdout }}"
+          kubernetes_ca_cert: "{{ k8s_ca_cert_content }}"
           token_reviewer_jwt: "{{ sa_jwt_token.stdout }}"
+          disable_local_ca_jwt: true
         status_code: [200, 204]
 
     # --- Create Vault policy ---
@@ -154,13 +198,13 @@
       register: es_apply
       changed_when: "'created' in es_apply.stdout or 'configured' in es_apply.stdout"
 
-    - name: Wait for ExternalSecret to sync
+    - name: Wait for ExternalSecret to be ready
       ansible.builtin.shell: >
         kubectl get externalsecret myapp-external-secret -n {{ demo_namespace }}
-        -o jsonpath='{.status.conditions[0].type}'
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
       register: es_status
-      until: es_status.stdout == "Ready"
-      retries: 20
+      until: es_status.stdout == "True"
+      retries: 30
       delay: 5
       changed_when: false
 
