@@ -1,0 +1,88 @@
+---
+- name: Install Strimzi Kafka Operator and deploy Kafka cluster
+  hosts: localhost
+  gather_facts: false
+  vars:
+    kafka_namespace: kafka
+    strimzi_version: "0.40.0"
+    strimzi_install_url: "https://strimzi.io/install/latest?namespace={{ kafka_namespace }}"
+    k8s_manifests_dir: "{{ playbook_dir }}/../../k8s/kafka"
+
+  tasks:
+    - name: Create Kafka namespace
+      ansible.builtin.command: kubectl create namespace {{ kafka_namespace }}
+      register: ns_create
+      changed_when: ns_create.rc == 0
+      failed_when:
+        - ns_create.rc != 0
+        - "'already exists' not in ns_create.stderr"
+
+    - name: Install Strimzi Operator CRDs and resources
+      ansible.builtin.command: >
+        kubectl apply -f {{ strimzi_install_url }} -n {{ kafka_namespace }}
+      register: strimzi_install
+      changed_when: "'created' in strimzi_install.stdout or 'configured' in strimzi_install.stdout"
+
+    - name: Wait for Strimzi operator deployment to be ready
+      ansible.builtin.command: >
+        kubectl rollout status deployment/strimzi-cluster-operator
+        -n {{ kafka_namespace }}
+        --timeout=300s
+      register: strimzi_rollout
+      changed_when: false
+
+    - name: Display Strimzi operator status
+      ansible.builtin.debug:
+        msg: "Strimzi operator is ready"
+
+    - name: Deploy Kafka cluster
+      ansible.builtin.command: kubectl apply -f {{ k8s_manifests_dir }}/kafka-cluster.yml
+      register: kafka_deploy
+      changed_when: "'created' in kafka_deploy.stdout or 'configured' in kafka_deploy.stdout"
+
+    - name: Wait for Kafka cluster to be ready
+      ansible.builtin.shell: >
+        kubectl get kafka demo-kafka -n {{ kafka_namespace }}
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: kafka_status
+      until: kafka_status.stdout == "True"
+      retries: 60
+      delay: 10
+      changed_when: false
+
+    - name: Deploy Kafka topic
+      ansible.builtin.command: kubectl apply -f {{ k8s_manifests_dir }}/kafka-topic.yml
+      register: topic_deploy
+      changed_when: "'created' in topic_deploy.stdout or 'configured' in topic_deploy.stdout"
+
+    - name: Wait for topic to be ready
+      ansible.builtin.shell: >
+        kubectl get kafkatopic demo-messages -n {{ kafka_namespace }}
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: topic_status
+      until: topic_status.stdout == "True"
+      retries: 20
+      delay: 5
+      changed_when: false
+
+    - name: Get minikube IP
+      ansible.builtin.command: minikube ip
+      register: minikube_ip
+      changed_when: false
+
+    - name: Get Kafka external bootstrap NodePort
+      ansible.builtin.shell: >
+        kubectl get svc demo-kafka-kafka-external-bootstrap -n {{ kafka_namespace }}
+        -o jsonpath='{.spec.ports[0].nodePort}'
+      register: kafka_nodeport
+      changed_when: false
+
+    - name: Display Kafka connection info
+      ansible.builtin.debug:
+        msg:
+          - "Kafka cluster is ready!"
+          - "Internal bootstrap: demo-kafka-kafka-bootstrap.kafka.svc.cluster.local:9092"
+          - "External bootstrap: {{ minikube_ip.stdout }}:{{ kafka_nodeport.stdout }}"
+          - "Topic 'demo-messages' created."
+          - ""
+          - "To connect from host machine, use: {{ minikube_ip.stdout }}:{{ kafka_nodeport.stdout }}"

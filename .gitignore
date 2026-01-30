@@ -5,3 +5,8 @@ __pycache__/
 .env
 *.log
 .claude/
+
+# .NET
+apps/bin/
+apps/*/bin/
+apps/*/obj/

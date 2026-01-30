@@ -1,0 +1,103 @@
+---
+- name: Deploy Keycloak on Kubernetes
+  hosts: localhost
+  gather_facts: false
+  vars:
+    keycloak_namespace: keycloak
+    k8s_manifests_dir: "{{ playbook_dir }}/../../k8s/keycloak"
+    realm_config: "{{ k8s_manifests_dir }}/realm-config.json"
+
+  tasks:
+    - name: Apply Keycloak namespace
+      ansible.builtin.command: kubectl apply -f {{ k8s_manifests_dir }}/namespace.yml
+      register: ns_apply
+      changed_when: "'created' in ns_apply.stdout or 'configured' in ns_apply.stdout"
+
+    - name: Apply Keycloak deployment and service
+      ansible.builtin.command: kubectl apply -f {{ k8s_manifests_dir }}/deployment.yml
+      register: kc_apply
+      changed_when: "'created' in kc_apply.stdout or 'configured' in kc_apply.stdout"
+
+    - name: Wait for Keycloak deployment to be ready
+      ansible.builtin.command: >
+        kubectl rollout status deployment/keycloak
+        -n {{ keycloak_namespace }}
+        --timeout=300s
+      register: kc_rollout
+      changed_when: false
+
+    - name: Get minikube IP
+      ansible.builtin.command: minikube ip
+      register: minikube_ip
+      changed_when: false
+
+    - name: Set Keycloak URL
+      ansible.builtin.set_fact:
+        keycloak_url: "http://{{ minikube_ip.stdout }}:30080"
+
+    - name: Wait for Keycloak to respond
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master"
+        method: GET
+        status_code: 200
+      register: kc_health
+      until: kc_health.status == 200
+      retries: 30
+      delay: 10
+
+    - name: Get Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: password
+          client_id: admin-cli
+          username: admin
+          password: admin
+        status_code: 200
+      register: admin_token_response
+
+    - name: Set admin token
+      ansible.builtin.set_fact:
+        admin_token: "{{ admin_token_response.json.access_token }}"
+
+    - name: Check if demo realm exists
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms/demo"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ admin_token }}"
+        status_code: [200, 404]
+      register: realm_check
+
+    - name: Read realm config
+      ansible.builtin.slurp:
+        src: "{{ realm_config }}"
+      register: realm_json
+      when: realm_check.status == 404
+
+    - name: Create demo realm
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/admin/realms"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ admin_token }}"
+          Content-Type: application/json
+        body: "{{ realm_json.content | b64decode }}"
+        body_format: json
+        status_code: [201]
+      when: realm_check.status == 404
+
+    - name: Display Keycloak info
+      ansible.builtin.debug:
+        msg:
+          - "Keycloak deployed successfully!"
+          - "URL: {{ keycloak_url }}"
+          - "Admin: admin / admin"
+          - "Realm: demo"
+          - "Client: demo-api (secret: demo-api-secret)"
+          - "Test user: testuser / testpass"
+          - ""
+          - "Token endpoint:"
+          - "  {{ keycloak_url }}/realms/demo/protocol/openid-connect/token"

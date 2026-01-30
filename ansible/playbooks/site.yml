@@ -17,7 +17,16 @@
 - name: "Step 5: Configure Vault K8s auth and deploy ESO resources"
   ansible.builtin.import_playbook: 05-configure.yml
 
-- name: "Step 6: Deploy ArgoCD Application"
+- name: "Step 6: Install Kafka (Strimzi)"
+  ansible.builtin.import_playbook: 06-kafka.yml
+
+- name: "Step 7: Deploy Keycloak"
+  ansible.builtin.import_playbook: 07-keycloak.yml
+
+- name: "Step 8: Build and deploy Demo API"
+  ansible.builtin.import_playbook: 08-demo-api.yml
+
+- name: "Step 9: Deploy ArgoCD Application"
   hosts: localhost
   gather_facts: false
   vars:
@@ -66,6 +75,9 @@
           - "  - ArgoCD: kubectl port-forward svc/argocd-server -n argocd 8080:443"
           - "  - ESO: Installed and configured"
           - "  - Nginx app: Deployed with secrets from Vault"
+          - "  - Kafka (Strimzi): Running in namespace kafka"
+          - "  - Keycloak: Running (NodePort 30080)"
+          - "  - Demo API: Running (NodePort 30500) - JWT protected"
           - ""
           - "Secret verification from Nginx pod:"
           - "  {{ secret_verify.stdout }}"
@@ -74,3 +86,5 @@
           - "  kubectl get externalsecrets -n demo-app"
           - "  kubectl get secrets -n demo-app"
           - "  kubectl get applications -n argocd"
+          - "  kubectl get kafka -n kafka"
+          - "  kubectl get kafkatopics -n kafka"

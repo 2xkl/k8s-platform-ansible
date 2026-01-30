@@ -1,0 +1,63 @@
+---
+- name: Build and deploy Demo API
+  hosts: localhost
+  gather_facts: false
+  vars:
+    api_src_dir: "{{ playbook_dir }}/../../apps/DemoApi"
+    api_image_name: "demo-api"
+    api_image_tag: "latest"
+    k8s_manifests_dir: "{{ playbook_dir }}/../../k8s/api"
+
+  tasks:
+    - name: Build Docker image for Demo API using minikube docker env
+      ansible.builtin.shell: |
+        eval $(minikube docker-env)
+        docker build -t {{ api_image_name }}:{{ api_image_tag }} {{ api_src_dir }}
+      register: docker_build
+      changed_when: docker_build.rc == 0
+
+    - name: Display build result
+      ansible.builtin.debug:
+        msg: "Docker image {{ api_image_name }}:{{ api_image_tag }} built successfully"
+
+    - name: Apply Demo API deployment and service
+      ansible.builtin.command: kubectl apply -f {{ k8s_manifests_dir }}/deployment.yml
+      register: api_apply
+      changed_when: "'created' in api_apply.stdout or 'configured' in api_apply.stdout"
+
+    - name: Wait for Demo API to be ready
+      ansible.builtin.command: >
+        kubectl rollout status deployment/demo-api
+        -n demo-app
+        --timeout=120s
+      register: api_rollout
+      changed_when: false
+
+    - name: Get minikube IP
+      ansible.builtin.command: minikube ip
+      register: minikube_ip
+      changed_when: false
+
+    - name: Verify API health endpoint
+      ansible.builtin.uri:
+        url: "http://{{ minikube_ip.stdout }}:30500/health"
+        method: GET
+        status_code: 200
+      register: api_health
+      retries: 10
+      delay: 5
+
+    - name: Display Demo API info
+      ansible.builtin.debug:
+        msg:
+          - "Demo API deployed successfully!"
+          - "Health:    http://{{ minikube_ip.stdout }}:30500/health"
+          - ""
+          - "Protected endpoints (require Keycloak JWT token):"
+          - "  GET  http://{{ minikube_ip.stdout }}:30500/api/userinfo"
+          - "  POST http://{{ minikube_ip.stdout }}:30500/api/messages  {\"message\": \"...\"}"
+          - "  GET  http://{{ minikube_ip.stdout }}:30500/api/messages?count=10"
+          - ""
+          - "Get token:"
+          - "  curl -s -X POST http://{{ minikube_ip.stdout }}:30080/realms/demo/protocol/openid-connect/token \\"
+          - "    -d 'grant_type=password&client_id=demo-api&client_secret=demo-api-secret&username=testuser&password=testpass'"
