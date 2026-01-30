@@ -1,0 +1,179 @@
+---
+- name: Configure Vault Kubernetes auth and deploy ESO resources
+  hosts: localhost
+  gather_facts: true
+  vars:
+    vault_addr: "http://127.0.0.1:8200"
+    vault_root_token: root
+    vault_container_name: vault-dev
+    demo_namespace: demo-app
+    k8s_manifests_dir: "{{ playbook_dir }}/../../k8s"
+
+  tasks:
+    # --- Apply namespace and service account first ---
+    - name: Apply demo-app namespace
+      ansible.builtin.command: kubectl apply -f {{ k8s_manifests_dir }}/namespace.yml
+      register: ns_apply
+      changed_when: "'created' in ns_apply.stdout or 'configured' in ns_apply.stdout"
+
+    - name: Apply ESO service account and token secret
+      ansible.builtin.command: kubectl apply -f {{ k8s_manifests_dir }}/service-account.yml
+      register: sa_apply
+      changed_when: "'created' in sa_apply.stdout or 'configured' in sa_apply.stdout"
+
+    - name: Wait for service account token to be populated
+      ansible.builtin.command: >
+        kubectl get secret eso-vault-auth-token -n {{ demo_namespace }}
+        -o jsonpath='{.data.token}'
+      register: sa_token_check
+      until: sa_token_check.stdout | length > 0
+      retries: 10
+      delay: 2
+      changed_when: false
+
+    # --- Gather K8s cluster info for Vault config ---
+    - name: Get Kubernetes API server URL
+      ansible.builtin.command: kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'
+      register: k8s_api_url
+      changed_when: false
+
+    - name: Get Kubernetes CA certificate
+      ansible.builtin.shell: >
+        kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d
+      register: k8s_ca_cert
+      changed_when: false
+
+    - name: Get service account JWT token
+      ansible.builtin.shell: >
+        kubectl get secret eso-vault-auth-token -n {{ demo_namespace }}
+        -o jsonpath='{.data.token}' | base64 -d
+      register: sa_jwt_token
+      changed_when: false
+
+    # --- Get Vault container IP for K8s to reach Vault ---
+    - name: Get host IP accessible from minikube
+      ansible.builtin.shell: >
+        minikube ssh 'cat /etc/resolv.conf' | grep nameserver | awk '{print $2}'
+      register: host_gateway_ip
+      changed_when: false
+
+    - name: Set Vault address for K8s pods
+      ansible.builtin.set_fact:
+        vault_k8s_addr: "http://{{ host_gateway_ip.stdout }}:8200"
+
+    - name: Display Vault address for K8s
+      ansible.builtin.debug:
+        msg: "Vault address accessible from K8s: {{ vault_k8s_addr }}"
+
+    # --- Configure Vault Kubernetes Auth ---
+    - name: Enable Kubernetes auth method in Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/auth/kubernetes"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+        body_format: json
+        body:
+          type: kubernetes
+        status_code: [200, 204]
+      register: k8s_auth_enable
+      failed_when:
+        - k8s_auth_enable.status not in [200, 204]
+        - "'path is already in use' not in (k8s_auth_enable.json.errors | default([]) | join(' '))"
+      changed_when: k8s_auth_enable.status in [200, 204]
+
+    - name: Configure Kubernetes auth method
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/auth/kubernetes/config"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+        body_format: json
+        body:
+          kubernetes_host: "{{ k8s_api_url.stdout }}"
+          kubernetes_ca_cert: "{{ k8s_ca_cert.stdout }}"
+          token_reviewer_jwt: "{{ sa_jwt_token.stdout }}"
+        status_code: [200, 204]
+
+    # --- Create Vault policy ---
+    - name: Create ESO policy in Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/policies/acl/eso-policy"
+        method: PUT
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+        body_format: json
+        body:
+          policy: |
+            path "secret/data/myapp/*" {
+              capabilities = ["read"]
+            }
+            path "secret/metadata/myapp/*" {
+              capabilities = ["read", "list"]
+            }
+        status_code: [200, 204]
+
+    # --- Create Vault role ---
+    - name: Create Vault Kubernetes auth role for ESO
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/auth/kubernetes/role/eso-role"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+        body_format: json
+        body:
+          bound_service_account_names:
+            - eso-vault-auth
+          bound_service_account_namespaces:
+            - "{{ demo_namespace }}"
+          policies:
+            - eso-policy
+          ttl: "24h"
+        status_code: [200, 204]
+
+    # --- Update SecretStore with correct Vault address and apply ---
+    - name: Read SecretStore template
+      ansible.builtin.slurp:
+        src: "{{ k8s_manifests_dir }}/secret-store.yml"
+      register: secret_store_template
+
+    - name: Generate SecretStore with correct Vault address
+      ansible.builtin.copy:
+        content: "{{ secret_store_template.content | b64decode | replace('VAULT_ADDR', host_gateway_ip.stdout) }}"
+        dest: "{{ k8s_manifests_dir }}/secret-store.yml"
+        mode: '0644'
+      changed_when: true
+
+    - name: Apply SecretStore
+      ansible.builtin.command: kubectl apply -f {{ k8s_manifests_dir }}/secret-store.yml
+      register: ss_apply
+      changed_when: "'created' in ss_apply.stdout or 'configured' in ss_apply.stdout"
+
+    - name: Apply ExternalSecret
+      ansible.builtin.command: kubectl apply -f {{ k8s_manifests_dir }}/external-secret.yml
+      register: es_apply
+      changed_when: "'created' in es_apply.stdout or 'configured' in es_apply.stdout"
+
+    - name: Wait for ExternalSecret to sync
+      ansible.builtin.shell: >
+        kubectl get externalsecret myapp-external-secret -n {{ demo_namespace }}
+        -o jsonpath='{.status.conditions[0].type}'
+      register: es_status
+      until: es_status.stdout == "Ready"
+      retries: 20
+      delay: 5
+      changed_when: false
+
+    - name: Verify K8s secret was created by ESO
+      ansible.builtin.command: >
+        kubectl get secret myapp-secret -n {{ demo_namespace }}
+      register: k8s_secret
+      changed_when: false
+
+    - name: Display results
+      ansible.builtin.debug:
+        msg:
+          - "Vault Kubernetes auth configured successfully!"
+          - "SecretStore and ExternalSecret deployed."
+          - "K8s Secret 'myapp-secret' created by ESO."
+          - "Secret details: {{ k8s_secret.stdout }}"

@@ -1,0 +1,76 @@
+---
+# Master playbook - uruchamia wszystko w kolejności
+# Użycie: cd ansible && ansible-playbook playbooks/site.yml
+
+- name: "Step 1: Start Minikube cluster"
+  ansible.builtin.import_playbook: 01-minikube.yml
+
+- name: "Step 2: Deploy HashiCorp Vault (dev mode)"
+  ansible.builtin.import_playbook: 02-vault.yml
+
+- name: "Step 3: Install ArgoCD"
+  ansible.builtin.import_playbook: 03-argocd.yml
+
+- name: "Step 4: Install External Secrets Operator"
+  ansible.builtin.import_playbook: 04-eso.yml
+
+- name: "Step 5: Configure Vault K8s auth and deploy ESO resources"
+  ansible.builtin.import_playbook: 05-configure.yml
+
+- name: "Step 6: Deploy ArgoCD Application"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    argocd_app_manifest: "{{ playbook_dir }}/../../argocd/nginx-secret-app.yml"
+  tasks:
+    - name: Apply ArgoCD Application manifest
+      ansible.builtin.command: kubectl apply -f {{ argocd_app_manifest }}
+      register: argocd_app_apply
+      changed_when: "'created' in argocd_app_apply.stdout or 'configured' in argocd_app_apply.stdout"
+
+    - name: Wait for ArgoCD Application to sync
+      ansible.builtin.shell: >
+        kubectl get application nginx-secret-app -n argocd
+        -o jsonpath='{.status.sync.status}'
+      register: app_sync_status
+      until: app_sync_status.stdout == "Synced"
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Wait for Nginx pod to be ready
+      ansible.builtin.command: >
+        kubectl rollout status deployment/nginx-secret-app
+        -n demo-app
+        --timeout=300s
+      register: nginx_rollout
+      changed_when: false
+
+    - name: Verify secret is available in Nginx pod
+      ansible.builtin.shell: >
+        kubectl exec -n demo-app deploy/nginx-secret-app --
+        sh -c 'echo "USERNAME=$SECRET_USERNAME PASSWORD=$SECRET_PASSWORD"'
+      register: secret_verify
+      changed_when: false
+
+    - name: Display final status
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - "  DEPLOYMENT COMPLETE!"
+          - "========================================="
+          - ""
+          - "Components:"
+          - "  - Minikube cluster: Running"
+          - "  - Vault (dev mode): http://127.0.0.1:8200"
+          - "  - ArgoCD: kubectl port-forward svc/argocd-server -n argocd 8080:443"
+          - "  - ESO: Installed and configured"
+          - "  - Nginx app: Deployed with secrets from Vault"
+          - ""
+          - "Secret verification from Nginx pod:"
+          - "  {{ secret_verify.stdout }}"
+          - ""
+          - "Useful commands:"
+          - "  kubectl get externalsecrets -n demo-app"
+          - "  kubectl get secrets -n demo-app"
+          - "  kubectl get applications -n argocd"

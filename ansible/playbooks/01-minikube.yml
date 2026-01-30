@@ -1,0 +1,45 @@
+---
+- name: Start Minikube cluster
+  hosts: localhost
+  gather_facts: true
+  tasks:
+    - name: Check if minikube is installed
+      ansible.builtin.command: minikube version
+      register: minikube_version
+      changed_when: false
+      failed_when: minikube_version.rc != 0
+
+    - name: Check if minikube is already running
+      ansible.builtin.command: minikube status --format='{{.Host}}'
+      register: minikube_status
+      changed_when: false
+      failed_when: false
+
+    - name: Start minikube cluster
+      ansible.builtin.command: minikube start --driver=docker --memory=4096 --cpus=2
+      when: minikube_status.stdout != "Running"
+      register: minikube_start
+      changed_when: minikube_start.rc == 0
+
+    - name: Enable ingress addon
+      ansible.builtin.command: minikube addons enable ingress
+      register: ingress_enable
+      changed_when: "'was successfully enabled' in ingress_enable.stdout"
+
+    - name: Verify minikube status
+      ansible.builtin.command: minikube status
+      register: minikube_final_status
+      changed_when: false
+
+    - name: Display minikube status
+      ansible.builtin.debug:
+        var: minikube_final_status.stdout_lines
+
+    - name: Get kubectl cluster info
+      ansible.builtin.command: kubectl cluster-info
+      register: cluster_info
+      changed_when: false
+
+    - name: Display cluster info
+      ansible.builtin.debug:
+        var: cluster_info.stdout_lines

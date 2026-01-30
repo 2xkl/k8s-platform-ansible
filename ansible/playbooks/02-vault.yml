@@ -1,0 +1,92 @@
+---
+- name: Deploy HashiCorp Vault in dev mode
+  hosts: localhost
+  gather_facts: true
+  vars:
+    vault_container_name: vault-dev
+    vault_port: 8200
+    vault_root_token: root
+    vault_addr: "http://127.0.0.1:{{ vault_port }}"
+
+  tasks:
+    - name: Check if Vault container is already running
+      ansible.builtin.command: docker ps -q -f name={{ vault_container_name }}
+      register: vault_running
+      changed_when: false
+
+    - name: Check if Vault container exists (stopped)
+      ansible.builtin.command: docker ps -aq -f name={{ vault_container_name }}
+      register: vault_exists
+      changed_when: false
+
+    - name: Remove stopped Vault container
+      ansible.builtin.command: docker rm {{ vault_container_name }}
+      when:
+        - vault_exists.stdout | length > 0
+        - vault_running.stdout | length == 0
+      changed_when: true
+
+    - name: Start Vault dev server in Docker
+      ansible.builtin.command: >
+        docker run -d
+        --name {{ vault_container_name }}
+        --cap-add=IPC_LOCK
+        -e VAULT_DEV_ROOT_TOKEN_ID={{ vault_root_token }}
+        -e VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
+        -p {{ vault_port }}:8200
+        hashicorp/vault:latest
+      when: vault_running.stdout | length == 0
+      register: vault_started
+      changed_when: vault_started.rc == 0
+
+    - name: Wait for Vault to be ready
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/health"
+        method: GET
+        status_code: 200
+      register: vault_health
+      until: vault_health.status == 200
+      retries: 15
+      delay: 2
+
+    - name: Display Vault health status
+      ansible.builtin.debug:
+        msg: "Vault is running and healthy at {{ vault_addr }}"
+
+    - name: Enable KV v2 secrets engine (idempotent check)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/mounts/secret"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+        status_code: [200, 400]
+      register: kv_engine_check
+      changed_when: false
+
+    - name: Write test secret to Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/secret/data/myapp/config"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          data:
+            username: admin
+            password: "s3cr3tP@ss"
+        status_code: [200, 204]
+      register: secret_write
+
+    - name: Verify secret was written
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/secret/data/myapp/config"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+        status_code: 200
+      register: secret_read
+
+    - name: Display stored secret keys
+      ansible.builtin.debug:
+        msg: "Secret stored successfully with keys: {{ secret_read.json.data.data.keys() | list }}"
