@@ -26,7 +26,7 @@
         kubectl rollout status deployment/argocd-server
         -n {{ argocd_namespace }}
         --timeout=300s
-      register: argocd_rollout
+      register: argocd_rollout2
       changed_when: false
 
     - name: Wait for ArgoCD repo server to be ready
