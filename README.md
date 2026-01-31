@@ -1,6 +1,6 @@
-# k8s_eso_ansible_app
+# k8s-platform-ansible
 
-Automatyzacja deploymentu infrastruktury Kubernetes z integracją HashiCorp Vault, External Secrets Operator, ArgoCD i Apache Kafka -- orkiestrowana przez Ansible.
+Automatyzacja deploymentu infrastruktury Kubernetes z integracją HashiCorp Vault, External Secrets Operator, ArgoCD, Keycloak i Apache Kafka -- orkiestrowana przez Ansible.
 
 ## Architektura
 
@@ -11,18 +11,21 @@ Vault (Docker)                ArgoCD (GitOps)
     ▼                              ▼
 External Secrets Operator ──► K8s Secret ──► Nginx (demo-app)
                                                │
-Strimzi Kafka ◄── .NET Producer/Consumer ──────┘
+Keycloak (IAM) ──► DemoApi (.NET 8) ───────────┘
+                       │
+Strimzi Kafka ◄── .NET Producer/Consumer ◄─────┘
 ```
 
 ## Stack technologiczny
 
 | Warstwa | Technologia |
 |---------|-------------|
-| Orkiestracja | Ansible (6 playbooków + master) |
+| Orkiestracja | Ansible (8 playbooków + master) |
 | Klaster K8s | Minikube + Docker |
 | Sekrety | HashiCorp Vault + External Secrets Operator |
 | GitOps | ArgoCD |
 | Messaging | Apache Kafka (Strimzi, KRaft) |
+| Identity | Keycloak (OpenID Connect) |
 | Aplikacje | .NET 8, Confluent.Kafka, Spectre.Console |
 | Narzędzia | Helm, kubectl |
 
@@ -39,7 +42,9 @@ Strimzi Kafka ◄── .NET Producer/Consumer ──────┘
 │       ├── 03-argocd.yml         # Instalacja ArgoCD
 │       ├── 04-eso.yml            # Instalacja ESO (Helm)
 │       ├── 05-configure.yml      # Konfiguracja Vault auth + ESO
-│       └── 06-kafka.yml          # Instalacja Kafka (Strimzi)
+│       ├── 06-kafka.yml          # Instalacja Kafka (Strimzi)
+│       ├── 07-keycloak.yml       # Deploy Keycloak + realm demo
+│       └── 08-demo-api.yml       # Build i deploy DemoApi
 ├── k8s/
 │   ├── namespace.yml             # Namespace demo-app
 │   ├── service-account.yml       # ServiceAccount dla ESO
@@ -48,15 +53,24 @@ Strimzi Kafka ◄── .NET Producer/Consumer ──────┘
 │   ├── nginx/
 │   │   ├── deployment.yml        # Nginx z sekretami jako env vars
 │   │   └── service.yml           # Service (NodePort)
-│   └── kafka/
-│       ├── strimzi-namespace.yml
-│       ├── kafka-cluster.yml     # Klaster Kafka (KRaft, 1 broker)
-│       └── kafka-topic.yml       # Topic: demo-messages
+│   ├── kafka/
+│   │   ├── strimzi-namespace.yml
+│   │   ├── kafka-cluster.yml     # Klaster Kafka (KRaft, 1 broker)
+│   │   └── kafka-topic.yml       # Topic: demo-messages
+│   ├── keycloak/
+│   │   ├── namespace.yml
+│   │   └── deployment.yml        # Keycloak deployment + service
+│   └── api/
+│       └── deployment.yml        # DemoApi deployment + service
+├── config/
+│   └── keycloak/
+│       └── realm-config.json     # Konfiguracja realm Keycloak
 ├── argocd/
 │   └── nginx-secret-app.yml     # ArgoCD Application
 ├── apps/
-│   ├── KafkaProducer/           # .NET 8 producer
-│   └── KafkaConsumer/           # .NET 8 consumer
+│   ├── KafkaProducer/           # .NET 8 interaktywny producer
+│   ├── KafkaConsumer/           # .NET 8 interaktywny consumer
+│   └── DemoApi/                 # .NET 8 Web API (Keycloak + Kafka)
 └── scripts/
     ├── build-apps.sh            # Budowanie aplikacji .NET
     └── cleanup.sh               # Czyszczenie zasobów
@@ -88,7 +102,9 @@ Master playbook wykonuje kolejno:
 4. Instalacja External Secrets Operator
 5. Konfiguracja Vault K8s auth + zasoby ESO
 6. Instalacja Kafka (Strimzi operator)
-7. Deploy aplikacji ArgoCD (Nginx z sekretami)
+7. Deploy Keycloak + konfiguracja realm demo
+8. Build i deploy DemoApi
+9. Deploy aplikacji ArgoCD (Nginx z sekretami)
 
 ### 2. Deploy pojedynczych komponentów
 
@@ -98,11 +114,38 @@ ansible-playbook playbooks/02-vault.yml
 # itd.
 ```
 
-### 3. Budowanie aplikacji Kafka
+### 3. Budowanie i uruchamianie aplikacji Kafka
+
+Budowanie (wymaga .NET 8 SDK):
 
 ```bash
 ./scripts/build-apps.sh
 ```
+
+Uruchamianie (Kafka musi byc dostepna na podanym adresie):
+
+```bash
+# Terminal 1 -- Consumer (nasluchuje wiadomosci)
+./apps/bin/KafkaConsumer localhost:31094
+
+# Terminal 2 -- Producer (wysyla wiadomosci)
+./apps/bin/KafkaProducer localhost:31094
+```
+
+Alternatywnie, bez budowania binarek:
+
+```bash
+# Consumer
+dotnet run --project apps/KafkaConsumer -- localhost:31094
+
+# Producer
+dotnet run --project apps/KafkaProducer -- localhost:31094
+```
+
+Producer: wpisz wiadomosc i nacisnij Enter, wpisz `exit` zeby zakonczyc.
+Consumer: nasluchuje w petli, Ctrl+C zeby zakonczyc.
+
+Domyslny adres bootstrapa (jesli nie podasz argumentu): `localhost:31094` (NodePort Kafki w Minikube).
 
 ### 4. Czyszczenie
 
@@ -140,3 +183,9 @@ Nginx Pod
 | ArgoCD | `kubectl port-forward svc/argocd-server -n argocd 8080:443` |
 | Nginx | `minikube service nginx-secret-service -n demo-app` |
 | Kafka | `localhost:31094` (NodePort) |
+| Keycloak | `http://<minikube-ip>:30080` (admin / admin) |
+| DemoApi | `http://<minikube-ip>:30500` (health: GET /health) |
+
+## Troubleshooting
+
+Przewodnik debugowania komponentow (ArgoCD, ESO, Vault, Kafka, Keycloak) znajduje sie w [docs/troubleshooting.md](docs/troubleshooting.md).
